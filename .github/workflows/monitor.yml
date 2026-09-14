@@ -1,0 +1,34 @@
+name: Commission Lead Monitor
+
+on:
+  schedule:
+    # every 30 minutes. GitHub may delay this slightly under load —
+    # that's normal and fine for this use case.
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}   # lets you click "Run workflow" manually to test
+
+permissions:
+  contents: write   # needed so the workflow can commit state.json back
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run monitor
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python monitor.py
+
+      - name: Save state
+        run: |
+          git config user.name "lead-monitor-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state.json
+          git diff --quiet --cached || git commit -m "update seen-posts state [skip ci]"
+          git push
