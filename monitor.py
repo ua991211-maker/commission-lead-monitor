@@ -38,18 +38,32 @@ SUBREDDITS = [
 ]
 
 # Case-insensitive; a post matches if ANY of these phrases appears in its
-# title or body. Keep this list specific — broad words like "art" alone
-# will flood you with noise.
+# title or body. Broadened to catch more natural phrasings, not just exact
+# matches — still specific enough to avoid noise from unrelated posts.
 KEYWORDS = [
     "looking for an artist",
     "looking for artist",
+    "looking for artists",
     "need an artist",
-    "commission an artist",
+    "need artist",
+    "want an artist",
+    "seeking artist",
+    "seeking an artist",
     "hiring an artist",
+    "hiring artist",
+    "commission an artist",
+    "artist needed",
+    "artist wanted",
     "need a logo",
     "need a banner",
+    "need a commission",
     "need artwork",
-    "commission open" ,
+    "need illustration",
+    "looking for an illustrator",
+    "looking for illustrator",
+    "hire an illustrator",
+    "commission open",
+    "commissions open",
     "taking commissions",  # note: this one catches *artists* advertising,
                             # not buyers — remove it if you only want buyers
 ]
