@@ -138,9 +138,12 @@ def matches_keywords(entry):
 
 
 def send_discord_alert(subreddit, entry, matched_keyword):
+    """Returns True if delivered successfully, False otherwise. Callers
+    should NOT mark a post as seen unless this returns True — otherwise
+    a Discord/network hiccup permanently loses that lead."""
     if not DISCORD_WEBHOOK_URL:
         print(f"[no webhook set] would alert: {entry['title']}")
-        return
+        return False
     payload = {
         "embeds": [{
             "title": entry["title"][:250],
@@ -161,8 +164,10 @@ def send_discord_alert(subreddit, entry, matched_keyword):
     )
     try:
         urllib.request.urlopen(req, timeout=15)
+        return True
     except Exception as e:
         print(f"Discord webhook failed: {e}", file=sys.stderr)
+        return False
 
 
 def main():
@@ -182,12 +187,17 @@ def main():
         for entry in entries:
             if entry["id"] in seen:
                 continue
-            new_seen.append(entry["id"])
             kw = matches_keywords(entry)
             if kw:
                 total_matches += 1
                 print(f"MATCH r/{sub}: {entry['title']} (kw: {kw})")
-                send_discord_alert(sub, entry, kw)
+                delivered = send_discord_alert(sub, entry, kw)
+                if delivered:
+                    new_seen.append(entry["id"])
+                # if delivery failed, don't mark as seen — it'll be
+                # retried on the next run instead of being lost
+            else:
+                new_seen.append(entry["id"])
 
         if i < len(SUBREDDITS) - 1:
             time.sleep(REQUEST_DELAY_SECONDS)
