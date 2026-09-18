@@ -171,7 +171,14 @@ def send_discord_alert(subreddit, entry, matched_keyword):
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         DISCORD_WEBHOOK_URL, data=data,
-        headers={"Content-Type": "application/json"}, method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,  # Discord's Cloudflare layer can
+                                        # 403 requests with generic/default
+                                        # User-Agents, especially from
+                                        # shared CI IP ranges
+        },
+        method="POST",
     )
     try:
         urllib.request.urlopen(req, timeout=15)
