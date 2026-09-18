@@ -38,8 +38,9 @@ SUBREDDITS = [
 ]
 
 # Case-insensitive; a post matches if ANY of these phrases appears in its
-# title or body. Broadened to catch more natural phrasings, not just exact
-# matches — still specific enough to avoid noise from unrelated posts.
+# title or body. Only buyer-intent phrases — "commissions open" and
+# similar were removed because real-world testing showed they mostly
+# catch OTHER ARTISTS advertising themselves, not people looking to hire.
 KEYWORDS = [
     "looking for an artist",
     "looking for artist",
@@ -62,10 +63,6 @@ KEYWORDS = [
     "looking for an illustrator",
     "looking for illustrator",
     "hire an illustrator",
-    "commission open",
-    "commissions open",
-    "taking commissions",  # note: this one catches *artists* advertising,
-                            # not buyers — remove it if you only want buyers
 ]
 
 STATE_FILE = "state.json"
@@ -208,6 +205,9 @@ def main():
                 delivered = send_discord_alert(sub, entry, kw)
                 if delivered:
                     new_seen.append(entry["id"])
+                    time.sleep(2)  # small gap between Discord posts so a
+                                    # burst of matches doesn't look like
+                                    # spam to Discord's abuse protection
                 # if delivery failed, don't mark as seen — it'll be
                 # retried on the next run instead of being lost
             else:
