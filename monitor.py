@@ -35,6 +35,8 @@ SUBREDDITS = [
     "HungryArtists",
     "artcommissions",
     "DesignJobs",
+    "artstore",
+    "Artists_forhire",
 ]
 
 # Case-insensitive; a post matches if ANY of these phrases appears in its
@@ -63,6 +65,11 @@ KEYWORDS = [
     "looking for an illustrator",
     "looking for illustrator",
     "hire an illustrator",
+    "any artists interested",
+    "recruiting an artist",
+    "in need of an artist",
+    "budget for art",
+    "willing to pay an artist",
 ]
 
 STATE_FILE = "state.json"
