@@ -25,6 +25,7 @@ import time
 import re
 import urllib.request
 import urllib.error
+from datetime import datetime, timezone
 from html import unescape
 import xml.etree.ElementTree as ET
 
@@ -137,14 +138,39 @@ def parse_entries(xml_bytes):
         link_el = entry.find("atom:link", ATOM_NS)
         link = link_el.get("href") if link_el is not None else ""
         author = entry.findtext("atom:author/atom:name", default="", namespaces=ATOM_NS)
+        published = entry.findtext("atom:published", default="", namespaces=ATOM_NS)
         entries.append({
             "id": entry_id,
             "title": strip_html(title),
             "body": strip_html(content),
             "link": link,
             "author": author,
+            "published": published,
         })
     return entries
+
+
+def post_age_label(published_str):
+    """Human-readable 'X minutes/hours ago', or '' if unparseable —
+    lets you triage freshness at a glance without doing math."""
+    if not published_str:
+        return ""
+    try:
+        posted = datetime.fromisoformat(published_str)
+        if posted.tzinfo is None:
+            posted = posted.replace(tzinfo=timezone.utc)
+        delta = datetime.now(timezone.utc) - posted
+        minutes = int(delta.total_seconds() // 60)
+        if minutes < 1:
+            return "just now"
+        if minutes < 60:
+            return f"{minutes}m ago"
+        hours = minutes // 60
+        if hours < 24:
+            return f"{hours}h ago"
+        return f"{hours // 24}d ago"
+    except Exception:
+        return ""
 
 
 def matches_keywords(entry):
@@ -162,6 +188,7 @@ def send_discord_alert(subreddit, entry, matched_keyword):
     if not DISCORD_WEBHOOK_URL:
         print(f"[no webhook set] would alert: {entry['title']}")
         return False
+    age = post_age_label(entry.get("published", ""))
     payload = {
         "embeds": [{
             "title": entry["title"][:250],
@@ -172,6 +199,7 @@ def send_discord_alert(subreddit, entry, matched_keyword):
                 {"name": "Subreddit", "value": f"r/{subreddit}", "inline": True},
                 {"name": "Matched", "value": matched_keyword, "inline": True},
                 {"name": "Author", "value": entry["author"] or "unknown", "inline": True},
+                {"name": "Posted", "value": age or "unknown", "inline": True},
             ],
         }]
     }
@@ -199,7 +227,9 @@ def main():
     state = load_state()
     seen = set(state["seen_ids"])
     new_seen = []
-    total_matches = 0
+    pending_matches = []  # (subreddit, entry, keyword) — collected across
+                            # all subreddits, then sorted by freshness
+                            # before any Discord message is sent
 
     for i, sub in enumerate(SUBREDDITS):
         try:
@@ -214,21 +244,37 @@ def main():
                 continue
             kw = matches_keywords(entry)
             if kw:
-                total_matches += 1
-                print(f"MATCH r/{sub}: {entry['title']} (kw: {kw})")
-                delivered = send_discord_alert(sub, entry, kw)
-                if delivered:
-                    new_seen.append(entry["id"])
-                    time.sleep(2)  # small gap between Discord posts so a
-                                    # burst of matches doesn't look like
-                                    # spam to Discord's abuse protection
-                # if delivery failed, don't mark as seen — it'll be
-                # retried on the next run instead of being lost
+                pending_matches.append((sub, entry, kw))
             else:
                 new_seen.append(entry["id"])
 
         if i < len(SUBREDDITS) - 1:
             time.sleep(REQUEST_DELAY_SECONDS)
+
+    # Oldest first, freshest last — so the most recent, most-likely-still-
+    # open post ends up at the bottom of the Discord channel, the first
+    # thing you see when you check it.
+    def sort_key(item):
+        published = item[1].get("published", "")
+        try:
+            return datetime.fromisoformat(published)
+        except Exception:
+            return datetime.min.replace(tzinfo=timezone.utc)
+
+    pending_matches.sort(key=sort_key)
+
+    total_matches = len(pending_matches)
+    for sub, entry, kw in pending_matches:
+        age = post_age_label(entry.get("published", ""))
+        print(f"MATCH r/{sub}: {entry['title']} (kw: {kw}, posted {age})")
+        delivered = send_discord_alert(sub, entry, kw)
+        if delivered:
+            new_seen.append(entry["id"])
+            time.sleep(2)  # small gap between Discord posts so a burst
+                            # of matches doesn't look like spam to
+                            # Discord's abuse protection
+        # if delivery failed, don't mark as seen — it'll be retried on
+        # the next run instead of being lost
 
     state["seen_ids"] = list(seen) + new_seen
     save_state(state)
