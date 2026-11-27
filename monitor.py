@@ -105,9 +105,11 @@ def save_state(state):
 # ---- HTTP -----------------------------------------------------------------
 
 
-def http_get(url, ua=USER_AGENT, max_retries=3):
+def http_get(url, ua=USER_AGENT, max_retries=3, extra_headers=None):
     for attempt in range(max_retries + 1):
-        req = urllib.request.Request(url, headers={"User-Agent": ua, "Accept": "*/*"})
+        headers = {"User-Agent": ua, "Accept": "*/*"}
+        headers.update(extra_headers or {})
+        req = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=20) as r:
                 return r.read()
@@ -205,10 +207,34 @@ def score_match(entry):
 # ---- SOURCES --------------------------------------------------------------
 
 
+BSKY_HANDLE = os.environ.get("BSKY_HANDLE", "").strip().lstrip("@")
+BSKY_APP_PASSWORD = os.environ.get("BSKY_APP_PASSWORD", "").strip()
+_bsky_token = None
+
+
+def bsky_login():
+    """Log in with a Bluesky app password (read-only use) and return a token."""
+    global _bsky_token
+    if _bsky_token or not (BSKY_HANDLE and BSKY_APP_PASSWORD):
+        return _bsky_token
+    req = urllib.request.Request(
+        "https://bsky.social/xrpc/com.atproto.server.createSession",
+        data=json.dumps({"identifier": BSKY_HANDLE, "password": BSKY_APP_PASSWORD}).encode(),
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT}, method="POST")
+    with urllib.request.urlopen(req, timeout=20) as r:
+        _bsky_token = json.loads(r.read())["accessJwt"]
+    return _bsky_token
+
+
 def fetch_bluesky(query):
-    url = ("https://public.api.bsky.app/xrpc/app.bsky.feed.searchPosts?"
-           + urllib.parse.urlencode({"q": query, "sort": "latest", "limit": BLUESKY_LIMIT}))
-    data = json.loads(http_get(url))
+    qs = urllib.parse.urlencode({"q": query, "sort": "latest", "limit": BLUESKY_LIMIT})
+    token = bsky_login()
+    if token:
+        url = "https://bsky.social/xrpc/app.bsky.feed.searchPosts?" + qs
+        data = json.loads(http_get(url, extra_headers={"Authorization": f"Bearer {token}"}))
+    else:
+        url = "https://public.api.bsky.app/xrpc/app.bsky.feed.searchPosts?" + qs
+        data = json.loads(http_get(url, ua=BROWSER_UA))
     return parse_bluesky(data)
 
 
@@ -307,6 +333,14 @@ def send_discord_alert(entry, kw):
 
 def gather():
     entries = []
+    try:
+        if BSKY_HANDLE and BSKY_APP_PASSWORD:
+            bsky_login()
+            print("Bluesky: logged in (read-only search)")
+        else:
+            print("Bluesky: no login set, trying public search")
+    except Exception as e:
+        print(f"Bluesky login failed: {e}", file=sys.stderr)
     for q in BLUESKY_QUERIES:
         try:
             got = fetch_bluesky(q)
