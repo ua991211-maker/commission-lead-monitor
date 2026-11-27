@@ -57,6 +57,8 @@ KEYWORDS = [
 NEGATIVE = [
     "commissions open", "commissions are open", "open for commissions",
     "taking commissions", "my commissions", "commission slots", "slots open",
+    "you're looking for", "you are looking for", "are you looking for",
+    "if you're looking for", "if you are looking for", "#jobs",
 ]
 
 SUBREDDIT_WEIGHT = {
@@ -243,6 +245,8 @@ def parse_bluesky(data):
     for p in data.get("posts", []):
         uri = p.get("uri", "")
         rec = p.get("record", {})
+        if rec.get("reply"):  # skip replies, keep only original posts
+            continue
         handle = p.get("author", {}).get("handle", "")
         rkey = uri.rsplit("/", 1)[-1]
         text = rec.get("text", "")
