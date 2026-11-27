@@ -65,7 +65,7 @@ SUBREDDIT_WEIGHT = {
     "gamedev": 5, "tattoos": 5, "logodesign": 5,
 }
 
-PORTFOLIO_LINK = "https://discord.gg/TPKqDNSku"
+PORTFOLIO_LINK = "https://discord.gg/qSzuA3pphz"
 
 REPLY_TEMPLATES = {
     "tattoo": "Hi! I saw your post about tattoo art. I'm an illustrator and would love to help. Portfolio: {link}",
