@@ -1,41 +1,45 @@
 name: Commission Lead Monitor
-
 on:
-  schedule:
-    # every 30 minutes. GitHub may delay this slightly under load —
-    # that's normal and fine for this use case.
-    - cron: "*/30 * * * *"
-  workflow_dispatch: {}   # lets you click "Run workflow" manually to test
-
-# Prevent overlapping runs (e.g. a manual test run colliding with the
-# scheduled run) from both trying to push state.json at once.
+  workflow_dispatch: {}
 concurrency:
   group: commission-lead-monitor
   cancel-in-progress: false
-
 permissions:
-  contents: write   # needed so the workflow can commit state.json back
-
+  contents: write
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Run monitor
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          GOOGLE_ALERT_FEEDS: ${{ secrets.GOOGLE_ALERT_FEEDS }}
         run: python monitor.py
-
       - name: Save state
         run: |
           git config user.name "lead-monitor-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add state.json
-          git diff --quiet --cached || git commit -m "update seen-posts state [skip ci]"
-          git pull --rebase origin main
-          git push
+          cp state.json /tmp/local_state.json
+          for i in 1 2 3 4 5 6; do
+            git fetch origin main
+            python3 - <<'PYEOF'
+          import json, subprocess
+          local = json.load(open("/tmp/local_state.json")).get("seen_ids", [])
+          try:
+              remote = json.loads(subprocess.check_output(["git", "show", "origin/main:state.json"])).get("seen_ids", [])
+          except Exception:
+              remote = []
+          merged = list(dict.fromkeys(remote + local))[-3000:]
+          json.dump({"seen_ids": merged}, open("/tmp/merged_state.json", "w"), indent=2)
+          PYEOF
+            git reset --hard origin/main
+            cp /tmp/merged_state.json state.json
+            git add state.json
+            if git diff --quiet --cached; then break; fi
+            git commit -m "update seen-posts state [skip ci]"
+            if git push origin HEAD:main; then break; else echo "retrying merge..."; fi
+          done
