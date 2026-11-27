@@ -1,23 +1,13 @@
 #!/usr/bin/env python3
 """
-Reddit commission-lead monitor.
+Commission lead monitor (free version, no Reddit API needed).
 
-How it works (no Reddit API key, no approval wait):
-  - Reddit's public .rss feeds work without authentication — both
-    per-subreddit feeds (e.g. reddit.com/r/forhire/new/.rss) AND
-    sitewide search (reddit.com/search.rss?q=...), which catches
-    buyer-intent posts in subreddits we didn't think to list.
-  - This never sends anything to Reddit or Discord users on your
-    behalf beyond posting into YOUR OWN webhook — it is a monitor, not
-    an outreach bot. You still send the actual message yourself.
-  - "Seen" post IDs are stored in state.json so the same post never
-    alerts twice; the workflow commits that file back to the repo
-    after each run so state survives between scheduled runs.
-  - Matches are scored (freshness + mentioned budget + subreddit
-    quality) and sent lowest-score-first, so the single best lead
-    lands last — at the bottom of Discord, the first thing you see.
+Sources:
+  1. Bluesky public search (no login, no key)
+  2. Google Alerts RSS feeds (you create the alerts; URLs go in a GitHub secret)
 
-Edit the CONFIG section below to tune everything.
+Matches are sent to YOUR private Discord channel via webhook. The bot never
+posts, DMs or comments anywhere. You reply yourself.
 """
 
 import json
@@ -25,353 +15,347 @@ import os
 import re
 import sys
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
+import urllib.error
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from html import unescape
 
-# ==== CONFIG ==============================================================
+# ---- CONFIG ---------------------------------------------------------------
 
-SUBREDDITS = [
-    "forhire",
-    "HungryArtists",
-    "artcommissions",
-    "DesignJobs",
-    "artstore",
-    "Artists_forhire",
-    "tattoos",       # people asking for tattoo design help
-    "gamedev",       # indie devs needing art
-    "INAT",          # "I Need A Team" — game dev collab/hire board
-    "logodesign",
+BLUESKY_QUERIES = [
+    '"looking for an artist"',
+    '"need an artist"',
+    '"commission an artist"',
+    '"hiring an artist"',
+    '"looking for an illustrator"',
+    '"need a logo"',
+    '"need a banner"',
+    '"looking for artist"',
+]
+BLUESKY_LIMIT = 25
+MAX_AGE_HOURS = 72  # ignore anything older than this
+
+# Google Alerts RSS URLs, one per line or comma-separated, in a GitHub secret.
+GOOGLE_ALERT_FEEDS = [
+    u.strip() for u in re.split(r"[\n,]+", os.environ.get("GOOGLE_ALERT_FEEDS", "")) if u.strip()
 ]
 
-# Sitewide searches — cast a wider net beyond the subreddits above.
-# Kept short: each one is an extra fetch, and broad queries return more
-# noise, so only the strongest buyer-intent phrases are searched this way.
-SEARCH_QUERIES = [
-    "looking for an artist",
-    "need an artist",
-    "hiring an artist",
-]
-
-# Case-insensitive; a post matches if ANY of these phrases appears in its
-# title or body. Buyer-intent only — seller phrases like "commissions
-# open" were deliberately excluded (they mostly catch competing artists
-# advertising themselves, not people looking to hire, per real testing).
 KEYWORDS = [
     "looking for an artist", "looking for artist", "looking for artists",
     "need an artist", "need artist", "want an artist",
-    "seeking artist", "seeking an artist",
-    "hiring an artist", "hiring artist", "commission an artist",
-    "artist needed", "artist wanted",
-    "need a logo", "need a banner", "need a commission",
-    "need artwork", "need illustration",
-    "looking for an illustrator", "looking for illustrator",
-    "hire an illustrator",
-    "any artists interested", "recruiting an artist",
+    "seeking artist", "seeking an artist", "hiring an artist", "hiring artist",
+    "commission an artist", "artist needed", "artist wanted",
+    "need a logo", "need a banner", "need a commission", "need artwork",
+    "need illustration", "looking for an illustrator", "looking for illustrator",
+    "hire an illustrator", "any artists interested", "recruiting an artist",
     "in need of an artist", "budget for art", "willing to pay an artist",
 ]
 
-# Subreddits you trust most for genuine buyer intent get a priority boost.
-# Anything not listed defaults to 0 — tune these as you see what converts.
+# Posts from artists advertising themselves. Skipped.
+NEGATIVE = [
+    "commissions open", "commissions are open", "open for commissions",
+    "taking commissions", "my commissions", "commission slots", "slots open",
+]
+
 SUBREDDIT_WEIGHT = {
-    "forhire": 15,
-    "artcommissions": 15,
-    "Artists_forhire": 15,
-    "HungryArtists": 10,
-    "INAT": 10,
-    "gamedev": 5,
-    "tattoos": 5,
-    "logodesign": 5,
-    "DesignJobs": 0,
-    "artstore": 0,
+    "forhire": 15, "artcommissions": 15, "Artists_forhire": 15,
+    "HungryArtists": 10, "INAT": 10,
+    "gamedev": 5, "tattoos": 5, "logodesign": 5,
 }
 
-# Suggested opening line per category — shown in the alert so replying is
-# copy/personalize/send instead of composing from scratch. NEVER sent
-# automatically; you still send it yourself. Replace the [link] with your
-# actual portfolio link.
 PORTFOLIO_LINK = "https://discord.gg/TPKqDNSku"
+
 REPLY_TEMPLATES = {
-    "tattoo": f"Hey! I do tattoo-ready line art — happy to help design yours. Some relevant work: {PORTFOLIO_LINK}. Want me to sketch a rough concept first?",
-    "logo": f"Hi! I do logo/brand design — glad to help. A few examples: {PORTFOLIO_LINK}. What's your budget and timeline looking like?",
-    "banner": f"Hey! I make banners/channel art like this — examples here: {PORTFOLIO_LINK}. Happy to start with a quick draft.",
-    "character": f"Hi! I'd love to help bring your character/OC to life — character work here: {PORTFOLIO_LINK}. Any reference images you can share?",
-    "default": f"Hey! Saw your post — I do work like this, examples here: {PORTFOLIO_LINK}. Happy to chat details!",
+    "tattoo": "Hi! I saw your post about tattoo art. I'm an illustrator and would love to help. Portfolio: {link}",
+    "logo": "Hi! I saw you need a logo. I design clean, custom logos. Portfolio: {link}",
+    "banner": "Hi! I saw you need a banner. I make custom banners and channel art. Portfolio: {link}",
+    "character": "Hi! I saw you're looking for character art. I draw OCs and characters. Portfolio: {link}",
+    "default": "Hi! I saw your post and I'd love to help with your art. Portfolio: {link}",
 }
 
+USER_AGENT = "commission-lead-monitor:v2.0 (personal lead alerts)"
+BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+REQUEST_DELAY_SECONDS = 2
 STATE_FILE = "state.json"
-USER_AGENT = "commission-lead-monitor:v1.0 (by /u/replace_with_your_username)"
-REQUEST_DELAY_SECONDS = 10  # be polite to Reddit's unauthenticated endpoint —
-                            # higher than usual since shared CI IPs get
-                            # throttled harder than a normal connection
-
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
-# ==== Helpers ==============================================================
+ATOM = {"a": "http://www.w3.org/2005/Atom"}
 
-ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
-SUBREDDIT_FROM_LINK_RE = re.compile(r"reddit\.com/r/([^/]+)/", re.IGNORECASE)
-BUDGET_RE = re.compile(r"\$\s?(\d{1,3}(?:,\d{3})*(?:\.\d+)?)")
+# ---- STATE ----------------------------------------------------------------
 
 
 def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    return {"seen_ids": []}
+    try:
+        with open(STATE_FILE) as f:
+            data = json.load(f)
+            data.setdefault("seen_ids", [])
+            return data
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"seen_ids": []}
 
 
 def save_state(state):
-    state["seen_ids"] = state["seen_ids"][-3000:]  # cap growth
+    state["seen_ids"] = state["seen_ids"][-3000:]
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
 
-def http_get_with_retry(url, max_retries=4):
-    """Shared fetch helper with 429 backoff, used for both subreddit
-    feeds and sitewide search."""
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    for attempt in range(1, max_retries + 1):
+# ---- HTTP -----------------------------------------------------------------
+
+
+def http_get(url, ua=USER_AGENT, max_retries=3):
+    for attempt in range(max_retries + 1):
+        req = urllib.request.Request(url, headers={"User-Agent": ua, "Accept": "*/*"})
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                return resp.read()
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return r.read()
         except urllib.error.HTTPError as e:
-            if e.code == 429 and attempt < max_retries:
-                retry_after = e.headers.get("Retry-After")
-                wait = int(retry_after) if retry_after and retry_after.isdigit() else attempt * 8
-                print(f"{url}: 429, retrying in {wait}s (attempt {attempt}/{max_retries})")
-                time.sleep(wait)
+            if e.code in (429, 500, 502, 503) and attempt < max_retries:
+                wait = e.headers.get("Retry-After")
+                time.sleep(min(int(wait) if wait and wait.isdigit() else 5 * (attempt + 1), 60))
+                continue
+            raise
+        except urllib.error.URLError:
+            if attempt < max_retries:
+                time.sleep(3 * (attempt + 1))
                 continue
             raise
 
 
-def fetch_subreddit_rss(subreddit):
-    return http_get_with_retry(f"https://www.reddit.com/r/{subreddit}/new/.rss")
-
-
-def fetch_search_rss(query):
-    q = urllib.parse.quote(query)
-    return http_get_with_retry(f"https://www.reddit.com/search.rss?q={q}&sort=new")
+# ---- HELPERS --------------------------------------------------------------
 
 
 def strip_html(text):
-    text = re.sub(r"<[^>]+>", " ", text or "")
-    return unescape(text).strip()
+    return re.sub(r"\s+", " ", unescape(re.sub(r"<[^>]+>", " ", text or ""))).strip()
 
 
-def parse_entries(xml_bytes):
-    root = ET.fromstring(xml_bytes)
-    entries = []
-    for entry in root.findall("atom:entry", ATOM_NS):
-        entry_id = entry.findtext("atom:id", default="", namespaces=ATOM_NS)
-        title = entry.findtext("atom:title", default="", namespaces=ATOM_NS)
-        content = entry.findtext("atom:content", default="", namespaces=ATOM_NS)
-        link_el = entry.find("atom:link", ATOM_NS)
-        link = link_el.get("href") if link_el is not None else ""
-        author = entry.findtext("atom:author/atom:name", default="", namespaces=ATOM_NS)
-        published = entry.findtext("atom:published", default="", namespaces=ATOM_NS)
-
-        m = SUBREDDIT_FROM_LINK_RE.search(link)
-        subreddit = m.group(1) if m else "unknown"
-
-        entries.append({
-            "id": entry_id,
-            "title": strip_html(title),
-            "body": strip_html(content),
-            "link": link,
-            "author": author,
-            "published": published,
-            "subreddit": subreddit,
-        })
-    return entries
-
-
-def post_age_label(published_str):
-    """Human-readable 'X minutes/hours ago', or '' if unparseable."""
-    if not published_str:
-        return ""
+def parse_time(s):
+    if not s:
+        return None
     try:
-        posted = datetime.fromisoformat(published_str)
-        if posted.tzinfo is None:
-            posted = posted.replace(tzinfo=timezone.utc)
-        minutes = int((datetime.now(timezone.utc) - posted).total_seconds() // 60)
-        if minutes < 1:
-            return "just now"
-        if minutes < 60:
-            return f"{minutes}m ago"
-        hours = minutes // 60
-        if hours < 24:
-            return f"{hours}h ago"
-        return f"{hours // 24}d ago"
-    except Exception:
-        return ""
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
 
 
-def minutes_old(published_str):
-    if not published_str:
-        return 99999
-    try:
-        posted = datetime.fromisoformat(published_str)
-        if posted.tzinfo is None:
-            posted = posted.replace(tzinfo=timezone.utc)
-        return max(0, int((datetime.now(timezone.utc) - posted).total_seconds() // 60))
-    except Exception:
-        return 99999
+def minutes_old(entry):
+    t = entry.get("published")
+    if not t:
+        return None
+    return max(0, int((datetime.now(timezone.utc) - t).total_seconds() // 60))
+
+
+def post_age_label(entry):
+    m = minutes_old(entry)
+    if m is None:
+        return "unknown"
+    if m < 60:
+        return f"{m}m ago"
+    if m < 1440:
+        return f"{m // 60}h {m % 60}m ago"
+    return f"{m // 1440}d ago"
 
 
 def matches_keywords(entry):
-    haystack = f"{entry['title']} {entry['body']}".lower()
+    text = f"{entry['title']} {entry['body']}".lower()
+    if any(n in text for n in NEGATIVE):
+        return None
     for kw in KEYWORDS:
-        if kw.lower() in haystack:
+        if kw in text:
             return kw
     return None
 
 
 def detect_budget(entry):
-    """Returns the largest $ amount mentioned, or None."""
-    haystack = f"{entry['title']} {entry['body']}"
-    amounts = [float(a.replace(",", "")) for a in BUDGET_RE.findall(haystack)]
-    return max(amounts) if amounts else None
+    text = f"{entry['title']} {entry['body']}"
+    vals = []
+    for m in re.finditer(r"\$\s?(\d{1,3}(?:,\d{3})*(?:\.\d+)?)", text):
+        try:
+            vals.append(float(m.group(1).replace(",", "")))
+        except ValueError:
+            pass
+    return max(vals) if vals else None
 
 
 def detect_category(entry):
-    text = f"{entry['title']} {entry['body']}".lower()
-    if "tattoo" in text:
+    t = f"{entry['title']} {entry['body']}".lower()
+    if "tattoo" in t:
         return "tattoo"
-    if "logo" in text:
+    if "logo" in t:
         return "logo"
-    if "banner" in text:
+    if "banner" in t:
         return "banner"
-    if " oc " in text or "character" in text or "oc!" in text or "oc " in text:
+    if any(w in t for w in ("character", " oc ", "ocs", "vtuber", "avatar", "pfp")):
         return "character"
     return "default"
 
 
-def score_match(entry, subreddit):
-    """Higher score = better lead. Sorting sends lowest-scored first,
-    so the best lead ends up last — at the bottom of Discord."""
-    score = 0.0
-    score += max(0, 500 - minutes_old(entry.get("published", "")))  # freshness, decays over ~8h
-    budget = detect_budget(entry)
-    if budget:
-        score += min(budget, 1000) / 2
-    score += SUBREDDIT_WEIGHT.get(subreddit, 0)
+def score_match(entry):
+    m = minutes_old(entry)
+    score = max(0, 500 - (m if m is not None else 500))
+    b = detect_budget(entry)
+    if b:
+        score += min(b / 2, 1000)
+    score += SUBREDDIT_WEIGHT.get(entry.get("subreddit", ""), 0)
     return score
 
 
-def send_discord_alert(entry, matched_keyword):
-    """Returns True if delivered successfully, False otherwise. Callers
-    should NOT mark a post as seen unless this returns True — otherwise
-    a Discord/network hiccup permanently loses that lead."""
+# ---- SOURCES --------------------------------------------------------------
+
+
+def fetch_bluesky(query):
+    url = ("https://public.api.bsky.app/xrpc/app.bsky.feed.searchPosts?"
+           + urllib.parse.urlencode({"q": query, "sort": "latest", "limit": BLUESKY_LIMIT}))
+    data = json.loads(http_get(url))
+    return parse_bluesky(data)
+
+
+def parse_bluesky(data):
+    out = []
+    for p in data.get("posts", []):
+        uri = p.get("uri", "")
+        rec = p.get("record", {})
+        handle = p.get("author", {}).get("handle", "")
+        rkey = uri.rsplit("/", 1)[-1]
+        text = rec.get("text", "")
+        out.append({
+            "id": uri,
+            "title": text[:120].replace("\n", " "),
+            "body": text,
+            "link": f"https://bsky.app/profile/{handle}/post/{rkey}",
+            "author": f"@{handle}",
+            "published": parse_time(rec.get("createdAt") or p.get("indexedAt")),
+            "subreddit": "",
+            "source": "Bluesky",
+        })
+    return out
+
+
+def real_url(link):
+    """Google Alerts wraps links as google.com/url?...&url=REAL&..."""
+    try:
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(link).query)
+        return q.get("url", [link])[0]
+    except Exception:
+        return link
+
+
+def parse_google_alert(xml_bytes):
+    root = ET.fromstring(xml_bytes)
+    out = []
+    for e in root.findall("a:entry", ATOM):
+        link_el = e.find("a:link", ATOM)
+        link = real_url(link_el.get("href")) if link_el is not None else ""
+        m = re.search(r"reddit\.com/r/([^/]+)/", link)
+        sub = m.group(1) if m else ""
+        title = strip_html(e.findtext("a:title", default="", namespaces=ATOM))
+        out.append({
+            "id": e.findtext("a:id", default=link, namespaces=ATOM) or link,
+            "title": title,
+            "body": strip_html(e.findtext("a:content", default="", namespaces=ATOM)),
+            "link": link,
+            "author": e.findtext("a:author/a:name", default="", namespaces=ATOM) or "unknown",
+            "published": parse_time(e.findtext("a:published", default="", namespaces=ATOM)
+                                    or e.findtext("a:updated", default="", namespaces=ATOM)),
+            "subreddit": sub,
+            "source": f"Google Alerts (r/{sub})" if sub else "Google Alerts",
+        })
+    return out
+
+
+# ---- DISCORD --------------------------------------------------------------
+
+
+def send_discord_alert(entry, kw):
     if not DISCORD_WEBHOOK_URL:
-        print(f"[no webhook set] would alert: {entry['title']}")
+        print(f"[no webhook] would alert: {entry['title']}")
         return False
-
-    age = post_age_label(entry.get("published", ""))
-    budget = detect_budget(entry)
-    category = detect_category(entry)
-    reply = REPLY_TEMPLATES.get(category, REPLY_TEMPLATES["default"])
-
+    cat = detect_category(entry)
     fields = [
-        {"name": "Subreddit", "value": f"r/{entry['subreddit']}", "inline": True},
-        {"name": "Matched", "value": matched_keyword, "inline": True},
-        {"name": "Posted", "value": age or "unknown", "inline": True},
+        {"name": "Source", "value": entry["source"], "inline": True},
+        {"name": "Matched", "value": kw, "inline": True},
+        {"name": "Posted", "value": post_age_label(entry), "inline": True},
         {"name": "Author", "value": entry["author"] or "unknown", "inline": True},
     ]
-    if budget:
-        fields.append({"name": "Budget mentioned", "value": f"${budget:,.0f}", "inline": True})
-    fields.append({"name": "Suggested reply", "value": reply[:1000], "inline": False})
-
-    payload = {
-        "embeds": [{
-            "title": entry["title"][:250],
-            "url": entry["link"],
-            "description": entry["body"][:500],
-            "color": 0xD9A755,
-            "fields": fields,
-        }]
-    }
-    data = json.dumps(payload).encode("utf-8")
+    b = detect_budget(entry)
+    if b:
+        fields.append({"name": "Budget mentioned", "value": f"${b:,.0f}", "inline": True})
+    fields.append({"name": "Suggested reply",
+                   "value": REPLY_TEMPLATES[cat].format(link=PORTFOLIO_LINK)[:1000], "inline": False})
+    payload = {"embeds": [{
+        "title": (entry["title"] or "New lead")[:250],
+        "url": entry["link"],
+        "description": entry["body"][:500],
+        "color": 0xD9A755,
+        "fields": fields,
+    }]}
     req = urllib.request.Request(
-        DISCORD_WEBHOOK_URL, data=data,
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": USER_AGENT,  # Discord's Cloudflare layer can 403
-                                        # requests with generic/default
-                                        # User-Agents from shared CI IPs
-        },
-        method="POST",
-    )
+        DISCORD_WEBHOOK_URL, data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT}, method="POST")
     try:
         urllib.request.urlopen(req, timeout=15)
         return True
     except Exception as e:
-        print(f"Discord webhook failed: {e}", file=sys.stderr)
+        print(f"Discord failed: {e}", file=sys.stderr)
         return False
+
+
+# ---- MAIN -----------------------------------------------------------------
+
+
+def gather():
+    entries = []
+    for q in BLUESKY_QUERIES:
+        try:
+            got = fetch_bluesky(q)
+            print(f"Bluesky {q}: {len(got)} posts")
+            entries += got
+        except Exception as e:
+            print(f"Bluesky {q} failed: {e}", file=sys.stderr)
+        time.sleep(REQUEST_DELAY_SECONDS)
+    for i, url in enumerate(GOOGLE_ALERT_FEEDS, 1):
+        try:
+            got = parse_google_alert(http_get(url, ua=BROWSER_UA))
+            print(f"Google Alert feed {i}: {len(got)} items")
+            entries += got
+        except Exception as e:
+            print(f"Google Alert feed {i} failed: {e}", file=sys.stderr)
+        time.sleep(REQUEST_DELAY_SECONDS)
+    if not GOOGLE_ALERT_FEEDS:
+        print("No GOOGLE_ALERT_FEEDS secret set; using Bluesky only.")
+    return entries
 
 
 def main():
     state = load_state()
     seen = set(state["seen_ids"])
-    new_seen = []
-    pending = []  # (entry, keyword) collected from all sources, scored
-                    # and sorted before anything is sent
-
-    sources = [("subreddit", s) for s in SUBREDDITS] + [("search", q) for q in SEARCH_QUERIES]
-
-    for i, (kind, value) in enumerate(sources):
-        try:
-            if kind == "subreddit":
-                xml_bytes = fetch_subreddit_rss(value)
-            else:
-                xml_bytes = fetch_search_rss(value)
-            entries = parse_entries(xml_bytes)
-        except Exception as e:
-            print(f"Failed to fetch {kind}={value}: {e}", file=sys.stderr)
+    pending, queued = [], set()
+    for e in gather():
+        if e["id"] in seen or e["id"] in queued:
             continue
-
-        for entry in entries:
-            if entry["id"] in seen:
-                continue
-            kw = matches_keywords(entry)
-            if kw:
-                pending.append((entry, kw))
-            else:
-                new_seen.append(entry["id"])
-
-        if i < len(sources) - 1:
-            time.sleep(REQUEST_DELAY_SECONDS)
-
-    # de-dupe: sitewide search and subreddit feeds can both surface the
-    # same post — keep one copy per post id
-    dedup = {}
-    for entry, kw in pending:
-        dedup[entry["id"]] = (entry, kw)
-    pending = list(dedup.values())
-
-    # lowest score first, highest score last — best lead ends up at the
-    # bottom of Discord, the first thing you see
-    pending.sort(key=lambda item: score_match(item[0], item[0]["subreddit"]))
-
-    total_matches = len(pending)
-    for entry, kw in pending:
-        score = score_match(entry, entry["subreddit"])
-        age = post_age_label(entry.get("published", ""))
-        print(f"MATCH r/{entry['subreddit']}: {entry['title']} (kw: {kw}, posted {age}, score {score:.0f})")
-        delivered = send_discord_alert(entry, kw)
-        if delivered:
-            new_seen.append(entry["id"])
-            time.sleep(2)  # small gap between Discord posts so a burst of
-                            # matches doesn't look like spam to Discord's
-                            # abuse protection
-        # if delivery failed, don't mark as seen — retried next run
-
-    state["seen_ids"] = list(seen) + new_seen
+        age = minutes_old(e)
+        if age is not None and age > MAX_AGE_HOURS * 60:
+            seen.add(e["id"])  # too old, don't re-check
+            state["seen_ids"].append(e["id"])
+            continue
+        kw = matches_keywords(e)
+        if kw:
+            queued.add(e["id"])
+            pending.append((score_match(e), e, kw))
+        else:
+            state["seen_ids"].append(e["id"])  # non-match, never needs re-check
+    pending.sort(key=lambda x: x[0])  # best lead lands last (bottom of Discord)
+    sent = 0
+    for _, e, kw in pending:
+        print(f"MATCH [{e['source']}] {e['title']} (kw: {kw})")
+        if send_discord_alert(e, kw):
+            state["seen_ids"].append(e["id"])
+            sent += 1
+        time.sleep(2)
     save_state(state)
-    print(f"Done. {total_matches} new match(es) this run.")
+    print(f"Done. {sent}/{len(pending)} lead(s) delivered.")
 
 
 if __name__ == "__main__":
