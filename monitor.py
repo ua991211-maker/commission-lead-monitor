@@ -33,7 +33,24 @@ BLUESKY_QUERIES = [
     '"need a logo"',
     '"need a banner"',
     '"looking for artist"',
+    '"looking to commission"',
+    '"want to commission"',
+    '"looking for a vtuber artist"',
+    '"need a vtuber model"',
+    '"need an emote artist"',
+    '"need a pfp"',
+    '"commission for my oc"',
+    '"can anyone draw"',
+    '"who can draw"',
+    '"looking for a character designer"',
+    '"need a character designer"',
+    '"looking for a rigger"',
+    '"need art for my"',
 ]
+
+# Mastodon public hashtag timelines (no login needed)
+MASTODON_INSTANCE = "https://mastodon.social"
+MASTODON_TAGS = ["lookingforartist", "artistwanted", "needanartist", "artrequest", "vtuberartist"]
 BLUESKY_LIMIT = 25
 MAX_AGE_HOURS = 72  # ignore anything older than this
 
@@ -51,6 +68,11 @@ KEYWORDS = [
     "need illustration", "looking for an illustrator", "looking for illustrator",
     "hire an illustrator", "any artists interested", "recruiting an artist",
     "in need of an artist", "budget for art", "willing to pay an artist",
+    "looking to commission", "want to commission", "looking for a vtuber artist",
+    "need a vtuber model", "need an emote artist", "need a pfp",
+    "commission for my oc", "can anyone draw", "who can draw",
+    "looking for a character designer", "need a character designer",
+    "looking for a rigger", "need art for my",
 ]
 
 # Posts from artists advertising themselves. Skipped.
@@ -79,7 +101,7 @@ REPLY_TEMPLATES = {
 
 USER_AGENT = "commission-lead-monitor:v2.0 (personal lead alerts)"
 BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-REQUEST_DELAY_SECONDS = 2
+REQUEST_DELAY_SECONDS = 1
 STATE_FILE = "state.json"
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
@@ -263,6 +285,30 @@ def parse_bluesky(data):
     return out
 
 
+def fetch_mastodon(tag):
+    url = f"{MASTODON_INSTANCE}/api/v1/timelines/tag/{tag}?limit=40"
+    return parse_mastodon(json.loads(http_get(url, ua=BROWSER_UA)))
+
+
+def parse_mastodon(items):
+    out = []
+    for p in items:
+        if p.get("reblog") or p.get("in_reply_to_id"):
+            continue
+        text = strip_html(p.get("content", ""))
+        out.append({
+            "id": p.get("uri") or p.get("url", ""),
+            "title": text[:120],
+            "body": text,
+            "link": p.get("url", ""),
+            "author": "@" + p.get("account", {}).get("acct", "unknown"),
+            "published": parse_time(p.get("created_at")),
+            "subreddit": "",
+            "source": "Mastodon",
+        })
+    return out
+
+
 def real_url(link):
     """Google Alerts wraps links as google.com/url?...&url=REAL&..."""
     try:
@@ -353,6 +399,14 @@ def gather():
         except Exception as e:
             print(f"Bluesky {q} failed: {e}", file=sys.stderr)
         time.sleep(REQUEST_DELAY_SECONDS)
+    for tag in MASTODON_TAGS:
+        try:
+            got = fetch_mastodon(tag)
+            print(f"Mastodon #{tag}: {len(got)} posts")
+            entries += got
+        except Exception as e:
+            print(f"Mastodon #{tag} failed: {e}", file=sys.stderr)
+        time.sleep(1)
     for i, url in enumerate(GOOGLE_ALERT_FEEDS, 1):
         try:
             got = parse_google_alert(http_get(url, ua=BROWSER_UA))
